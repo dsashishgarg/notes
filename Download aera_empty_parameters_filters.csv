@@ -1,0 +1,21 @@
+Report Name,Subject Area,Filter Column,Operator,Value
+Consumption Empty Parameter,Empties Outbound Rail,Origin Location.In Scope Solver,equals,Y
+Returns Empty Parameter,Empties Inbound Rail,Destination Location.In Scope Solver,equals,Y
+Returns Empty Parameter,Empties Inbound Rail,Origin Location In Scope Solver,equals,Y
+Returns Empty Parameter,Empties Inbound Rail,Empties Inbound.Load Status,equals,E
+Starting Inventory Empty Parameter,Starting Inventory Empties Rail,,,
+Potential Diversion Empty Parameter,Potential Diversion Empties Rail,Total Transit time customer - New MFG,greater than,0
+Transportation Empty Parameter,Transportation Returns Empties Rail,To Location Code.In Scope Solver,equals,Y
+Transportation Empty Parameter,Transportation Returns Empties Rail,Original Return Location.In Scope Solver,equals,Y
+Transportation Internal Empty Parameter,Internal Transportation Empties Rail,Destination Code.In Scope Solver,equals,Y
+Transportation Internal Empty Parameter,Internal Transportation Empties Rail,Origin Code.In Scope Solver,equals,Y
+Transportation Internal Empty Parameter,Internal Transportation Empties Rail,Transit Time,greater than,0
+Storage Capacity Empty Parameter,Storage Capacity Rail,Storage Capacity Dim.Load Status,equals,E
+Storage Capacity Empty Parameter,Storage Capacity Rail,Location Code.In Scope Solver,equals,Y
+Storage Capacity Empty Parameter,Storage Capacity Rail,Storage Capacity Dim.Active Status,equals,Y
+Storage Capacity Empty Parameter,Storage Capacity Rail,Location Code.Active Status,equals,Y
+Storage Cost Empty Parameter,Storage Cost Rail,Storage Cost Dim.Load Status,equals,E
+Storage Cost Empty Parameter,Storage Cost Rail,Location Code.In Scope Solver,equals,Y
+Storage Cost Empty Parameter,Storage Cost Rail,Location Code.Active Status,equals,Y
+Storage Cost Empty Parameter,Storage Cost Rail,Storage Cost Dim.Active Status,equals,Y
+Allowed Size Empty Parameter,Railcar Size Storage Eligibility,,,
