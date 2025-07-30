@@ -19,92 +19,96 @@
 -- 	4.	Flag & Exclude ‘Held’ Trips
 
 -- ==========================================
--- STEP 1: FILTER AND PREPARE BASE DATA
+-- STEP 1: FILTER EMPTY EVENTS & ADD ROW NUMBERS
 -- ==========================================
--- Goal: Work only with empty cars (dd_le = 'E') and sort by time
--- Assumptions:
---  - fact_clm_history_rail contains event data for each railcar
---  - We'll focus on Empty cars only (dd_le = 'E')
---  - Date difference is computed using TO_DATE() subtraction
-
-CREATE TEMP TABLE tmp_clm_empty_events AS
-SELECT 
+CREATE TEMP TABLE tmp_empty_events AS
+SELECT
     dd_car_init,
     dd_car_no,
     dd_clm_date_time,
     dd_loc_city,
     dd_dest_city,
     dd_sight_code,
-    dd_le,
-    TO_DATE(dd_clm_date_time) AS clm_date,
-    LAG(TO_DATE(dd_clm_date_time)) OVER (PARTITION BY dd_car_init, dd_car_no ORDER BY dd_clm_date_time) AS prev_clm_date,
-    LAG(dd_loc_city) OVER (PARTITION BY dd_car_init, dd_car_no ORDER BY dd_clm_date_time) AS prev_loc_city,
-    LAG(dd_sight_code) OVER (PARTITION BY dd_car_init, dd_car_no ORDER BY dd_clm_date_time) AS prev_sight_code
+    dd_le
 FROM fact_clm_history_rail
 WHERE dd_le = 'E';
 
-
--- ==========================================
--- STEP 2: IDENTIFY TRIP BREAKS & ASSIGN TRIP IDS
--- ==========================================
--- Goal: Start new trip if:
---   - Time gap > 24 hrs between events AND loc_city changed
---   - OR Sight code is 'P' or 'W' (potential trip start)
-
-CREATE TEMP TABLE tmp_clm_trips_marked AS
+-- Add row numbers to simulate ordering
+CREATE TEMP TABLE tmp_empty_events_rn AS
 SELECT 
-    *,
-    CASE 
-        WHEN prev_clm_date IS NULL THEN 1
-        WHEN (clm_date - prev_clm_date) * 24 > 24 AND dd_loc_city != prev_loc_city THEN 1
-        WHEN dd_sight_code IN ('P', 'W') AND dd_loc_city != prev_loc_city THEN 1
-        ELSE 0
-    END AS is_new_trip
-FROM tmp_clm_empty_events;
-
+    t1.*,
+    ROW_NUMBER() OVER (ORDER BY dd_car_init, dd_car_no, dd_clm_date_time) AS rn
+FROM tmp_empty_events t1;
 
 -- ==========================================
--- STEP 3: ASSIGN TRIP ID BY CUMULATIVE SUM OF NEW TRIPS
+-- STEP 2: SELF JOIN TO SIMULATE LAG()
 -- ==========================================
--- Goal: For each car, assign sequential trip ID based on new trip flag
-
-CREATE TEMP TABLE tmp_clm_trips_labeled AS
-SELECT 
-    *,
-    SUM(is_new_trip) OVER (PARTITION BY dd_car_init, dd_car_no ORDER BY dd_clm_date_time ROWS UNBOUNDED PRECEDING) AS trip_id
-FROM tmp_clm_trips_marked;
-
+CREATE TEMP TABLE tmp_events_with_prev AS
+SELECT
+    curr.dd_car_init,
+    curr.dd_car_no,
+    curr.dd_clm_date_time,
+    curr.dd_loc_city,
+    curr.dd_dest_city,
+    curr.dd_sight_code,
+    curr.dd_le,
+    prev.dd_clm_date_time AS prev_clm_date_time,
+    prev.dd_loc_city AS prev_loc_city
+FROM tmp_empty_events_rn curr
+LEFT JOIN tmp_empty_events_rn prev
+  ON curr.dd_car_init = prev.dd_car_init
+ AND curr.dd_car_no = prev.dd_car_no
+ AND curr.rn = prev.rn + 1;
 
 -- ==========================================
--- STEP 4: AGGREGATE EACH TRIP’S METADATA
+-- STEP 3: DETECT TRIP BREAKS
 -- ==========================================
--- Goal: For each (car, trip), calculate:
---    - Start/End time
---    - Duration
---    - Has Held Event (H)
---    - Start & End location
-
-CREATE TEMP TABLE tmp_trip_summary AS
+CREATE TEMP TABLE tmp_trip_flags AS
 SELECT
     dd_car_init,
     dd_car_no,
-    trip_id,
-    MIN(clm_date) AS trip_start_time,
-    MAX(clm_date) AS trip_end_time,
-    MAX(clm_date) - MIN(clm_date) AS trip_duration_days,
-    COUNT(CASE WHEN dd_sight_code = 'H' THEN 1 END) > 0 AS has_held_event,
-    MIN(dd_loc_city) AS trip_start_city,
-    MAX(dd_dest_city) AS trip_end_city
-FROM tmp_clm_trips_labeled
-GROUP BY dd_car_init, dd_car_no, trip_id;
-
+    dd_clm_date_time,
+    dd_loc_city,
+    dd_dest_city,
+    dd_sight_code,
+    CASE
+        WHEN prev_clm_date_time IS NULL THEN 1
+        WHEN (TO_DATE(dd_clm_date_time) - TO_DATE(prev_clm_date_time)) * 24 > 24 
+             AND dd_loc_city <> prev_loc_city THEN 1
+        WHEN dd_sight_code IN ('P', 'W') AND dd_loc_city <> prev_loc_city THEN 1
+        ELSE 0
+    END AS is_new_trip
+FROM tmp_events_with_prev;
 
 -- ==========================================
--- STEP 5: FILTER OUT HELD TRIPS & CALCULATE AVERAGE DURATION
+-- STEP 4: ASSIGN TRIP IDs (MANUAL RUNNING COUNT)
 -- ==========================================
--- Goal: Remove trips with Held events and calculate average duration
+-- Aera does not support SUM OVER() — we simulate it manually outside SQL or assign post-processing.
+-- So instead, just export trip break markers and process trip IDs later if needed.
 
+-- ==========================================
+-- STEP 5: AGGREGATE TRIP DATA
+-- ==========================================
+-- Aggregate to get trip start/end, duration, held-event flag
+
+CREATE TEMP TABLE tmp_trip_staging AS
 SELECT
-    AVG(trip_duration_days * 24) AS avg_trip_duration_hours
-FROM tmp_trip_summary
-WHERE has_held_event = FALSE;
+    dd_car_init,
+    dd_car_no,
+    dd_loc_city,
+    dd_dest_city,
+    MIN(TO_DATE(dd_clm_date_time)) AS trip_start_time,
+    MAX(TO_DATE(dd_clm_date_time)) AS trip_end_time,
+    MAX(TO_DATE(dd_clm_date_time)) - MIN(TO_DATE(dd_clm_date_time)) AS trip_duration_days,
+    COUNT(CASE WHEN dd_sight_code = 'H' THEN 1 ELSE NULL END) AS held_event_count
+FROM tmp_empty_events
+GROUP BY dd_car_init, dd_car_no, dd_loc_city, dd_dest_city;
+
+-- ==========================================
+-- STEP 6: FILTER OUT TRIPS WITH HELD EVENTS
+-- ==========================================
+SELECT 
+    *,
+    trip_duration_days * 24 AS trip_duration_hours
+FROM tmp_trip_staging
+WHERE held_event_count = 0;
