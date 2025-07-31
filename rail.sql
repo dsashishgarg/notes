@@ -1,114 +1,190 @@
+/* ---------------------------------------------------------------------------------------------------
+   SQL SCRIPT: Trip Segmentation and Junction Timing for Empty Railcars (fact_clm_history_rail)
+   ---------------------------------------------------------------------------------------------------
 
--- ==========================================
--- Patterns Observed
--- ==========================================
--- 	1.	Trip Start Indicators: Usually starts with P (Departure), sometimes with W (Released).
--- 	2.	Trip End Indicators: Typically ends with D (Arrival at Destination) or Z (Actual Placement).
--- 	3.	Silent Period Gaps: Long time gaps between empty movements (like 5+ days) could mean the railcar was loaded and not present in the empty dataset.
--- 	4.	Held Events (H): A trip can contain H events, but we should flag and exclude such trips in analysis.
--- 	5.	City Shift Check: dd_loc_city change + dd_dest_city remains constant often implies movement.
--- 	6.	Trip restart: If a time gap > 24 hours and city changes, it’s a new trip.
+   GOAL:
+   -----
+   To analyze empty railcar movements and compute the average time taken to reach the first junction (Sight Code = 'J').
+   Additionally, we want to track supporting trip characteristics like:
+     - total junctions (count of 'J')
+     - if trip had any held events (Sight Code = 'H')
+     - route consistency
+     - trip start/end city/timestamp
+     - exclude held trips from final average calculation
 
--- ==========================================
--- -- Implementation Plan
--- ==========================================
--- We’ll break it into 4 steps:
--- 	1.	Filter & Sort Raw Data into a temp table
--- 	2.	Assign Trip IDs using logic: new trip if gap > X hours AND city changes
--- 	3.	Aggregate Trip Stats (start, end, duration)
--- 	4.	Flag & Exclude ‘Held’ Trips
+   FINAL OUTPUT:
+   -------------
+   One row per empty trip with:
+     - trip ID
+     - railcar ID
+     - start and end timestamp
+     - start and end city
+     - route code
+     - time to first junction
+     - total junctions
+     - held event flag
 
--- ==========================================
--- STEP 1: FILTER EMPTY EVENTS & ADD ROW NUMBERS
--- ==========================================
-CREATE TEMP TABLE tmp_empty_events AS
-SELECT
-    dd_car_init,
-    dd_car_no,
-    dd_clm_date_time,
-    dd_loc_city,
-    dd_dest_city,
-    dd_sight_code,
-    dd_le
-FROM fact_clm_history_rail
-WHERE dd_le = 'E';
+   ---------------------------------------------------------------------------------------------------
+   PATTERNS & FINDINGS FROM EXPLORATION
+   -------------------------------------
+   ✅ Sight Codes:
+      - 'P', 'A' are dominant (usually frequent updates or in-transit events)
+      - 'D' often marks end of trip, usually at destination
+      - 'W' can be seen as restart or re-initiation of trip (not always)
+      - 'H' = HELD => Should NOT be used to split trips but should be flagged
+      - 'J' = Junction => Track this for "first junction timing" metric
 
--- Add row numbers to simulate ordering
-CREATE TEMP TABLE tmp_empty_events_rn AS
-SELECT 
-    t1.*,
-    ROW_NUMBER() OVER (ORDER BY dd_car_init, dd_car_no, dd_clm_date_time) AS rn
-FROM tmp_empty_events t1;
+   ✅ Important Columns:
+      - dd_car_init, dd_car_no => Unique Railcar
+      - dd_le => Empty ('E') or Loaded ('L')
+      - dd_loc_city, dd_dest_city => Key spatial markers
+      - dd_clm_date_time => Event timestamp
+      - dd_route_code => Generally constant within a trip, may change if rerouted
 
--- ==========================================
--- STEP 2: SELF JOIN TO SIMULATE LAG()
--- ==========================================
-CREATE TEMP TABLE tmp_events_with_prev AS
-SELECT
-    curr.dd_car_init,
-    curr.dd_car_no,
-    curr.dd_clm_date_time,
-    curr.dd_loc_city,
-    curr.dd_dest_city,
-    curr.dd_sight_code,
-    curr.dd_le,
-    prev.dd_clm_date_time AS prev_clm_date_time,
-    prev.dd_loc_city AS prev_loc_city
-FROM tmp_empty_events_rn curr
-LEFT JOIN tmp_empty_events_rn prev
-  ON curr.dd_car_init = prev.dd_car_init
- AND curr.dd_car_no = prev.dd_car_no
- AND curr.rn = prev.rn + 1;
+   ✅ Trip Segmentation Logic:
+      - Focus on EMPTY (dd_le = 'E') railcar events only
+      - Within each railcar’s ordered events:
+         - A new trip starts when:
+            * The destination city changes compared to the last trip
+            * OR route code changes
+            * OR more than X hours (e.g., 48) of inactivity between events
+      - H events may pause trips for days — don't use to split, but mark trips having them
 
--- ==========================================
--- STEP 3: DETECT TRIP BREAKS
--- ==========================================
-CREATE TEMP TABLE tmp_trip_flags AS
-SELECT
-    dd_car_init,
-    dd_car_no,
-    dd_clm_date_time,
-    dd_loc_city,
-    dd_dest_city,
-    dd_sight_code,
-    CASE
-        WHEN prev_clm_date_time IS NULL THEN 1
-        WHEN (TO_DATE(dd_clm_date_time) - TO_DATE(prev_clm_date_time)) * 24 > 24 
-             AND dd_loc_city <> prev_loc_city THEN 1
-        WHEN dd_sight_code IN ('P', 'W') AND dd_loc_city <> prev_loc_city THEN 1
-        ELSE 0
-    END AS is_new_trip
-FROM tmp_events_with_prev;
+   ✅ Junction Logic:
+      - Count total J events per trip
+      - Calculate time from trip start to first J event (used for average time metric)
 
--- ==========================================
--- STEP 4: ASSIGN TRIP IDs (MANUAL RUNNING COUNT)
--- ==========================================
--- Aera does not support SUM OVER() — we simulate it manually outside SQL or assign post-processing.
--- So instead, just export trip break markers and process trip IDs later if needed.
+   ---------------------------------------------------------------------------------------------------
+   STEP 1: FILTER EMPTY RAILCAR EVENTS
+   --------------------------------------------------------------------------------------------------- */
 
--- ==========================================
--- STEP 5: AGGREGATE TRIP DATA
--- ==========================================
--- Aggregate to get trip start/end, duration, held-event flag
-
-CREATE TEMP TABLE tmp_trip_staging AS
-SELECT
-    dd_car_init,
-    dd_car_no,
-    dd_loc_city,
-    dd_dest_city,
-    MIN(TO_DATE(dd_clm_date_time)) AS trip_start_time,
-    MAX(TO_DATE(dd_clm_date_time)) AS trip_end_time,
-    MAX(TO_DATE(dd_clm_date_time)) - MIN(TO_DATE(dd_clm_date_time)) AS trip_duration_days,
-    COUNT(CASE WHEN dd_sight_code = 'H' THEN 1 ELSE NULL END) AS held_event_count
-FROM tmp_empty_events
-GROUP BY dd_car_init, dd_car_no, dd_loc_city, dd_dest_city;
-
--- ==========================================
--- STEP 6: FILTER OUT TRIPS WITH HELD EVENTS
--- ==========================================
-SELECT 
+WITH empty_events AS (
+  SELECT
     *,
-    trip_duration_days * 24 AS trip_duration_hours
-FROM tmp_trip_staging
-WHERE held_event_count = 0;
+    CONCAT(dd_car_init, '-', dd_car_no) AS railcar_id
+  FROM
+    fact_clm_history_rail
+  WHERE
+    dd_le = 'E'
+),
+
+/* ---------------------------------------------------------------------------------------------------
+   STEP 2: SORT EVENTS BY RAILCAR AND TIMESTAMP
+   We emulate LAG by using GROUPED RANK() approach
+--------------------------------------------------------------------------------------------------- */
+
+ranked_events AS (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (PARTITION BY railcar_id ORDER BY dd_clm_date_time) AS rn
+  FROM
+    empty_events
+),
+
+/* ---------------------------------------------------------------------------------------------------
+   STEP 3: CREATE EVENT PAIRS TO COMPARE EACH EVENT WITH PREVIOUS EVENT
+--------------------------------------------------------------------------------------------------- */
+
+event_pairs AS (
+  SELECT
+    curr.railcar_id,
+    curr.dd_clm_date_time AS current_time,
+    curr.dd_loc_city AS current_city,
+    curr.dd_dest_city AS current_dest,
+    curr.dd_route_code AS current_route,
+    curr.sight_code AS current_sight,
+    prev.dd_clm_date_time AS prev_time,
+    prev.dd_dest_city AS prev_dest,
+    prev.dd_route_code AS prev_route,
+    DATETIME_DIFF(curr.dd_clm_date_time, prev.dd_clm_date_time, HOUR) AS hours_diff
+  FROM
+    ranked_events curr
+  LEFT JOIN ranked_events prev
+    ON curr.railcar_id = prev.railcar_id AND curr.rn = prev.rn + 1
+),
+
+/* ---------------------------------------------------------------------------------------------------
+   STEP 4: IDENTIFY TRIP BREAK POINTS
+   A new trip starts when:
+     - Destination city changed
+     - OR route code changed
+     - OR time gap > 48 hours
+--------------------------------------------------------------------------------------------------- */
+
+trip_breaks AS (
+  SELECT
+    *,
+    CASE
+      WHEN prev_time IS NULL THEN 1  -- First record for railcar
+      WHEN current_dest != prev_dest THEN 1
+      WHEN current_route != prev_route THEN 1
+      WHEN hours_diff > 48 THEN 1
+      ELSE 0
+    END AS is_trip_start
+  FROM
+    event_pairs
+),
+
+/* ---------------------------------------------------------------------------------------------------
+   STEP 5: ASSIGN TRIP IDs USING CUMULATIVE SUM OF trip_start FLAGS
+--------------------------------------------------------------------------------------------------- */
+
+trip_segments AS (
+  SELECT
+    *,
+    CONCAT(railcar_id, '_', CAST(SUM(is_trip_start) OVER (PARTITION BY railcar_id ORDER BY current_time ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS STRING)) AS trip_id
+  FROM
+    trip_breaks
+),
+
+/* ---------------------------------------------------------------------------------------------------
+   STEP 6: AGGREGATE TRIP DETAILS
+--------------------------------------------------------------------------------------------------- */
+
+trip_summary AS (
+  SELECT
+    trip_id,
+    railcar_id,
+    MIN(current_time) AS trip_start_time,
+    MAX(current_time) AS trip_end_time,
+    MIN(current_city) AS trip_start_city,
+    MAX(current_dest) AS trip_end_dest,
+    MAX(current_route) AS route_code,
+    COUNTIF(current_sight = 'J') AS junction_count,
+    MIN(CASE WHEN current_sight = 'J' THEN current_time ELSE NULL END) AS first_junction_time,
+    MAX(CASE WHEN current_sight = 'H' THEN 1 ELSE 0 END) AS has_held_flag
+  FROM
+    trip_segments
+  GROUP BY
+    trip_id, railcar_id
+),
+
+/* ---------------------------------------------------------------------------------------------------
+   STEP 7: FINAL OUTPUT – CALCULATE TIME TO FIRST JUNCTION
+--------------------------------------------------------------------------------------------------- */
+
+final_trips AS (
+  SELECT
+    *,
+    DATETIME_DIFF(first_junction_time, trip_start_time, HOUR) AS time_to_first_junction_hrs
+  FROM
+    trip_summary
+)
+
+-- ---------------------------------------------------------------------------------------------------
+-- FINAL SELECT
+-- ---------------------------------------------------------------------------------------------------
+
+SELECT
+  trip_id,
+  railcar_id,
+  trip_start_time,
+  trip_end_time,
+  trip_start_city,
+  trip_end_dest,
+  route_code,
+  junction_count,
+  time_to_first_junction_hrs,
+  has_held_flag
+FROM
+  final_trips;
